@@ -11,8 +11,12 @@ import java.nio.channels.SocketChannel
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 
+fun File.clear() {
+    this.writeText("")
+}
 
-fun printByteArray(buffer: ByteBuffer) {
+// Used for testing.
+private fun printByteArray(buffer: ByteBuffer) {
     val byteArray = buffer.array()
     println(byteArray.joinToString(" ") { "0x%02X".format(it) })
 }
@@ -29,93 +33,154 @@ fun printUsage() {
     println()
 }
 
-
 fun main(args: Array<String>) {
-    runServer(args)
+    Server().run(args)
 }
 
-private fun runServer(arguments: Array<String>) {
+class Server {
 
-    if (arguments.size != 2) {
-        printUsage()
-        return
+    private var file: File? = null
+
+    fun run(arguments: Array<String>) {
+
+        if (arguments.size != 2) {
+            printUsage()
+            return
+        }
+
+        val (socketPath, filePath) = arguments
+        val address = UnixDomainSocketAddress.of(socketPath)
+
+        file = File(filePath).let { file ->
+            // I assume that it's intended for the "server" to create files if it doesn't already exist
+            if (file.createNewFile()) {
+                println("The file $file doesn't exist, it will be created for you.")
+            }
+            file
+        }
+
+        Executors.newVirtualThreadPerTaskExecutor().use { executor ->
+            ServerSocketChannel.open(StandardProtocolFamily.UNIX).use { serverChannel ->
+                tryDelete(socketPath)
+                serverChannel.bind(address)
+                println("Server listening on $address")
+                while (true) {
+                    serverChannel.accept().use { clientChannel ->
+                        executor.submit {
+                            try {
+                                println("Connection received.")
+                                val msg = try {
+                                    val msg = MessageProtocol.readMessageFromChannel(clientChannel)
+                                    handleMessage(msg)
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                    Message.Error(e.message)
+                                }
+                                if (msg != Message.None) {
+                                    val retBuff = MessageProtocol.serializeMessage(msg)
+                                    retBuff.flip()
+                                    clientChannel.write(retBuff)
+                                }
+                            } catch (e: Exception) {
+                                println("Error processing message: ${e.javaClass.simpleName} - ${e.message}")
+                                e.printStackTrace()
+                            }
+                        }.get()
+                    }
+                }
+
+            }
+        }
     }
 
-    val args = Arguments(arguments[0], arguments[1])
-    val address = UnixDomainSocketAddress.of(args.socketPath)
+    private fun tryDelete(filename: String) {
+        fun deleteFileIfExists(filename: String): Boolean {
+            val file = File(filename)
+            return if (file.exists()) {
+                file.delete()
+            } else {
+                false
+            }
+        }
+        if (deleteFileIfExists(filename)) {
+            println("Socket file deleted.")
+        }
+    }
 
+    /**
+     *
+     * */
+    private fun handleMessage(message: Message): Message {
+        return when (message) {
+            is Message.Ping -> Message.Ok
+            is Message.Write -> {
+                message.content?.let { this.file?.appendText(it) }
+                    ?: throw IllegalArgumentException("File cannot be null.")
+                Message.Ok
+            }
 
-
-    Executors.newVirtualThreadPerTaskExecutor().use { executor ->
-        ServerSocketChannel.open(StandardProtocolFamily.UNIX).use { serverChannel ->
-
-            serverChannel.bind(address)
-            println("Server listening on $address")
-            while (true) {
-                serverChannel.accept().use { clientChannel ->
-                    executor.submit {
-                        println("Connection received.")
-                        val message = MessageProtocol.readMessageFromChannel(clientChannel)
-                        val temp = "AAA_AAA_"
-                        val okMsg = MessageProtocol.serializeMessage(Message.Write(temp.length, temp))
-                        printByteArray(okMsg)
-
-                        val bytesWritten = clientChannel.write(okMsg.flip())
-                        println("Bytes written: $bytesWritten")
-                    }
+            is Message.Clear -> {
+                try {
+                    this.file?.clear()
+                    Message.Ok
+                } catch (e: Exception) {
+                    Message.Error(e.message)
                 }
             }
 
+            else -> {
+                Message.None
+            }
         }
     }
 }
 
-fun tryDelete(filename: String) {
-    fun deleteFileIfExists(filename: String): Boolean {
-        val file = File(filename)
-        return if (file.exists()) {
-            file.delete()
-        } else {
-            false
-        }
-    }
-    if (deleteFileIfExists(filename)) {
-        println("File deleted.")
-    }
-}
-
-data class Arguments(val socketPath: String, val filePath: String)
 
 sealed interface Message {
 
     val type: Int
     val contentLength: Int
+    /**
+     * Used as a marker for no value, instead of null.
+     * */
+    data object None : Message {
+        override val type: Int
+            get() = throw NotImplementedError("Shouldn't get called")
+        override val contentLength: Int
+            get() = throw NotImplementedError("Shouldn't get called")
+    }
 
-    class Ok() : Message {
+    data object Ok : Message {
         override val type: Int
             get() = 0x1
         override val contentLength: Int
             get() = 0
     }
 
-    data class Write(override val contentLength: Int, val content: String? = null) : Message {
+    data class Write(val content: String? = null) : Message {
         override val type: Int
             get() = 0x2
+
+        override val contentLength: Int
+            get() = content?.length ?: 0
     }
 
-    class Clear() : Message {
+    data object Clear : Message {
         override val type: Int
             get() = 0x3
         override val contentLength: Int
             get() = 0
     }
 
-    data class Error(override val contentLength: Int, val content: String? = null) : Message {
+    data class Error(val content: String? = null) : Message {
         override val type: Int
             get() = 0x4
+        override val contentLength: Int
+            get() = content?.length ?: 0
+
     }
 
-    class Ping() : Message {
+    data object Ping : Message {
         override val type: Int
             get() = 0x5
         override val contentLength: Int
@@ -124,6 +189,7 @@ sealed interface Message {
 
 
 }
+
 
 object MessageProtocol {
     private const val HEADER_SIZE = 8
@@ -136,7 +202,9 @@ object MessageProtocol {
 
             is Message.Error -> message.content
             is Message.Write -> message.content
+            is Message.None -> throw IllegalArgumentException("Cannot serialize Message.None!")
         }
+
         val buf = ByteBuffer.allocate(HEADER_SIZE + message.contentLength)
         buf.put(message.type.toByte())
         buf.put(RESERVED)
@@ -145,26 +213,31 @@ object MessageProtocol {
         return buf
     }
 
-    fun deserializeWithContent(type: Int, contentLength: Int, contentBuffer: ByteBuffer): Message {
+    private fun deserializeWithContent(type: Int, contentLength: Int, contentBuffer: ByteBuffer): Message {
         val content = StandardCharsets.UTF_8.decode(contentBuffer).toString()
 
-        return when (type) {
-            2 -> Message.Write(contentLength, content)
-            4 -> Message.Error(contentLength, content)
-            else -> throw
-            // @formatter:off
-                IllegalArgumentException("Unknown message type: $type with content length: $contentLength received")
-            // @formatter:on
+        if (content.length != contentLength) {
+            throw IllegalStateException("Length of content string and content length from header don't match.")
         }
+
+        // @formatter:off
+        return when (type) {
+            2 -> Message.Write(content)
+            4 -> Message.Error(content)
+            // Can be replaced with Message.Error with the same text, to avoid unnecessary try / catches
+            else -> throw
+            IllegalArgumentException("Unknown message type: $type with content length: $contentLength received")
+        }
+        // @formatter:on
     }
 
     private fun deserializeEmptyMessage(type: Int): Message {
         return when (type) {
-            1 -> Message.Ok()
-            2 -> Message.Write(0)
-            3 -> Message.Clear()
-            4 -> Message.Error(0)
-            5 -> Message.Ping()
+            1 -> Message.Ok
+            2 -> Message.Write()
+            3 -> Message.Clear
+            4 -> Message.Error()
+            5 -> Message.Ping
             else -> throw IllegalArgumentException("Unknown message type: $type received")
         }
     }
@@ -172,19 +245,25 @@ object MessageProtocol {
     fun readMessageFromChannel(channel: SocketChannel): Message {
         val headerBuffer = ByteBuffer.allocate(HEADER_SIZE)
         while (headerBuffer.hasRemaining()) {
-            if (channel.read(headerBuffer) == 1) throw EOFException("Channel closed unexpectedly")
+            if (channel.read(headerBuffer) == -1) throw EOFException("Channel closed unexpectedly")
         }
         headerBuffer.flip()
         val type = headerBuffer.get().toInt()
-        // Skip three bytes
-        (1..RESERVED.size).forEach {
+
+        // Skip reserved bytes
+        (1..RESERVED.size).forEach { _ ->
             headerBuffer.get()
         }
+
         // Always read contentLength as big endian.
         val order = headerBuffer.order()
         headerBuffer.order(ByteOrder.BIG_ENDIAN)
         val contentLength = headerBuffer.getInt(4)
         headerBuffer.order(order)
+
+        if (contentLength < 0) throw IllegalArgumentException("Content length cannot be less than zero. Was: $contentLength")
+
+
         if (contentLength == 0) {
             return deserializeEmptyMessage(type = type)
         }
@@ -198,8 +277,5 @@ object MessageProtocol {
             type = type, contentLength = contentLength, contentBuffer = contentBuffer
         )
     }
-
-
 }
-
 
