@@ -24,7 +24,7 @@ fun printUsage() {
             Usage: ssh-example <socket-path> <file-path>
             Example: ssh-example /tmp/ssh-example ~/example.txt
             Note: Running the program will delete the socket file, if it exists.  
-            """
+            """.trimIndent()
     )
     println()
 }
